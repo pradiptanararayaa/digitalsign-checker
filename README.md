@@ -41,7 +41,7 @@ git clone https://github.com/pradiptanararayaa/digitalsign-checker
 Masuk ke direktori:
 
 ```bash
-cd REPOSITORY
+cd digitalsign-checker
 ```
 
 Jalankan program:
