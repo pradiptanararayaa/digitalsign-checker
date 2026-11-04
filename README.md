@@ -35,7 +35,7 @@ py -m pip install psutil
 Clone repository:
 
 ```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
+git clone https://github.com/pradiptanararayaa/digitalsign-checker
 ```
 
 Masuk ke direktori:
