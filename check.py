@@ -245,13 +245,42 @@ def lookup_hashes_online(items, workers=5):
                 }
     return results
 
-def analyze(r, cfg, kernel=False):
+def _hash_in_config(digest, values):
+    digest = (digest or "").replace(" ", "").upper()
+    return digest and digest in {
+        str(value).replace(" ", "").upper() for value in values
+    }
+
+
+def analyze(r, cfg, kernel=False, hashes=None):
     reasons = []
     status = (r.get("Status") or "Unknown").lower()
     subject = r.get("Subject") or ""
     publisher = common_name(subject)
     thumb = (r.get("Thumbprint") or "").replace(" ", "").upper()
     filename = os.path.basename(r.get("Path") or "").lower()
+    hashes = hashes or {}
+
+    blocked_hashes = cfg.get("blocklist_hashes", {})
+    for algorithm in ("sha256", "sha1", "md5"):
+        if _hash_in_config(hashes.get(algorithm), blocked_hashes.get(algorithm, [])):
+            return "BLOCKED_HASH", [
+                f"{algorithm.upper()} file masuk blocklist hash."
+            ]
+
+    if kernel and filename in {
+        x.lower() for x in cfg.get("known_vulnerable_drivers", [])
+    }:
+        return "KNOWN_VULNERABLE_DRIVER", [
+            "Nama driver termasuk daftar driver rentan yang dikenal."
+        ]
+
+    trusted_hashes = cfg.get("trusted_hashes", {})
+    for algorithm in ("sha256", "sha1", "md5"):
+        if _hash_in_config(hashes.get(algorithm), trusted_hashes.get(algorithm, [])):
+            return "TRUSTED", [
+                f"{algorithm.upper()} file cocok dengan trusted hash exact-match."
+            ]
 
     if status == "valid":
         if thumb and thumb in {
@@ -262,24 +291,28 @@ def analyze(r, cfg, kernel=False):
 
         trusted = cfg.get("trusted_publishers", {})
         trusted_names = list(trusted.keys())
-        normalized_publisher = normalize(publisher)
-        normalized_trusted = {normalize(x) for x in trusted_names}
+        publisher_key = (publisher or "").casefold().strip()
+        exact_trusted = {
+            (name or "").casefold().strip() for name in trusted_names
+        }
 
-        if normalized_publisher in normalized_trusted:
+        if publisher_key and publisher_key in exact_trusted:
             return "TRUSTED", [
-                "Authenticode valid dan publisher cocok dengan allowlist."
+                "Authenticode valid dan publisher cocok dengan allowlist exact-match."
             ]
 
+        normalized_publisher = normalize(publisher)
+        normalized_trusted = {normalize(x) for x in trusted_names}
         close = difflib.get_close_matches(
             normalized_publisher,
             list(normalized_trusted),
             n=3,
             cutoff=0.78
-        )
+        ) if normalized_publisher else []
         if close:
             reasons.append(
                 "Nama publisher mirip dengan publisher tepercaya; "
-                "perlu pemeriksaan manual."
+                "confusable tidak dianggap trusted otomatis."
             )
         else:
             reasons.append(
@@ -322,6 +355,7 @@ def analyze(r, cfg, kernel=False):
 
 SEVERITY = [
     "BLOCKED_CERTIFICATE",
+    "BLOCKED_HASH",
     "HASH_MISMATCH",
     "NOT_TRUSTED",
     "KNOWN_VULNERABLE_DRIVER",
@@ -334,6 +368,7 @@ SEVERITY = [
 
 BAD = {
     "BLOCKED_CERTIFICATE",
+    "BLOCKED_HASH",
     "HASH_MISMATCH",
     "NOT_TRUSTED",
     "KNOWN_VULNERABLE_DRIVER",
@@ -349,6 +384,7 @@ VERDICT_COLOR = {
     "HASH_MISMATCH": "31",
     "NOT_TRUSTED": "31",
     "BLOCKED_CERTIFICATE": "31",
+    "BLOCKED_HASH": "31",
     "KNOWN_VULNERABLE_DRIVER": "31",
 }
 
@@ -391,13 +427,34 @@ def collect_files(target):
     return found
 
 
+def _driver_image_path(service_name):
+    """Resolve path driver loaded dari ImagePath service registry."""
+    try:
+        import winreg
+        key_path = rf"SYSTEM\CurrentControlSet\Services\{service_name}"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            image_path, _ = winreg.QueryValueEx(key, "ImagePath")
+    except (ImportError, FileNotFoundError, OSError):
+        return None
+
+    image_path = os.path.expandvars(str(image_path).strip().strip('"'))
+    match = re.search(r"(?:[A-Za-z]:)?[^\"']+?\.sys", image_path, re.I)
+    if not match:
+        return None
+
+    path = match.group(0).strip().replace("/", "\\")
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    if path.lower().startswith("\\systemroot\\"):
+        path = os.path.join(system_root, path[len("\\SystemRoot\\"):])
+    elif path.lower().startswith("system32\\"):
+        path = os.path.join(system_root, path)
+    elif not os.path.isabs(path):
+        path = os.path.join(system_root, "System32", "drivers", os.path.basename(path))
+    return os.path.abspath(path)
+
+
 def loaded_drivers():
-    command = [
-        "driverquery",
-        "/FO",
-        "CSV",
-        "/NH"
-    ]
+    command = ["driverquery", "/FO", "CSV", "/NH"]
     proc = subprocess.run(
         command,
         capture_output=True,
@@ -412,20 +469,24 @@ def loaded_drivers():
     import csv
     from io import StringIO
 
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
     drivers = []
+    unresolved = []
     for row in csv.reader(StringIO(proc.stdout)):
-        if len(row) >= 3:
-            path = row[1].strip()
-            if path and path.lower().endswith(".sys"):
-                if not os.path.isabs(path):
-                    path = os.path.join(
-                        os.environ.get("SystemRoot", r"C:\Windows"),
-                        "System32",
-                        "drivers",
-                        os.path.basename(path)
-                    )
-                if os.path.isfile(path):
-                    drivers.append(os.path.abspath(path))
+        if not row or not row[0].strip():
+            continue
+        service_name = row[0].strip()
+        path = _driver_image_path(service_name)
+        if not path:
+            path = os.path.join(system_root, "System32", "drivers", service_name + ".sys")
+        if os.path.isfile(path):
+            drivers.append(os.path.abspath(path))
+        else:
+            unresolved.append(service_name)
+
+    if not drivers:
+        detail = ", ".join(unresolved[:10]) or "tidak ada service driver"
+        raise RuntimeError(f"Path file driver tidak bisa di-resolve: {detail}")
     return drivers
 
 
@@ -445,6 +506,131 @@ def pid_modules(pid):
             if os.path.splitext(path)[1].lower() in EXTS:
                 modules.append(os.path.abspath(path))
     return modules
+
+
+def _private_executable_regions(pid):
+    """Cari MEM_PRIVATE executable pages via VirtualQueryEx.
+
+    Heuristik: reflective/manual mapping sering memakai private executable pages.
+    Tidak membuktikan injection; JIT dan runtime sah juga bisa menghasilkan sinyal.
+    """
+    if os.name != "nt":
+        return []
+
+    class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BaseAddress", ctypes.c_void_p),
+            ("AllocationBase", ctypes.c_void_p),
+            ("AllocationProtect", ctypes.c_ulong),
+            ("RegionSize", ctypes.c_size_t),
+            ("State", ctypes.c_ulong),
+            ("Protect", ctypes.c_ulong),
+            ("Type", ctypes.c_ulong),
+        ]
+
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    MEM_COMMIT = 0x1000
+    MEM_PRIVATE = 0x20000
+    PAGE_EXECUTE = 0x10
+    PAGE_EXECUTE_READ = 0x20
+    PAGE_EXECUTE_READWRITE = 0x40
+    PAGE_EXECUTE_WRITECOPY = 0x80
+    executable = {PAGE_EXECUTE, PAGE_EXECUTE_READ,
+                  PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY}
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not handle:
+        return ["Tidak bisa membuka proses untuk VirtualQueryEx; jalankan sebagai Administrator."]
+
+    findings = []
+    mbi = MEMORY_BASIC_INFORMATION()
+    address = 0
+    try:
+        while address < (1 << (8 * ctypes.sizeof(ctypes.c_void_p) - 1)):
+            got = kernel32.VirtualQueryEx(
+                handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
+            )
+            if not got:
+                break
+            if (mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE
+                    and (mbi.Protect & 0xFF) in executable):
+                findings.append({
+                    "base": f"0x{int(mbi.BaseAddress or 0):X}",
+                    "size": int(mbi.RegionSize),
+                    "protection": int(mbi.Protect),
+                })
+            next_address = int(mbi.BaseAddress or 0) + int(mbi.RegionSize)
+            if next_address <= address:
+                break
+            address = next_address
+    finally:
+        kernel32.CloseHandle(handle)
+    return findings
+
+
+def process_injection_findings(pid, modules):
+    """Heuristik defensif untuk mapped modules dan executable private memory."""
+    try:
+        import psutil
+    except ImportError:
+        return ["Modul psutil belum terpasang; pemeriksaan process injection dilewati."]
+
+    try:
+        process = psutil.Process(pid)
+        process_name = process.name()
+        exe = os.path.abspath(process.exe()) if process.exe() else ""
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+        return [f"Tidak bisa membaca proses {pid}: {exc}"]
+
+    findings = []
+    user_root = os.path.expandvars(r"%USERPROFILE%").lower()
+    temp_root = os.path.abspath(tempfile.gettempdir()).lower()
+    windows_root = os.path.abspath(os.environ.get("SystemRoot", r"C:\Windows")).lower()
+    exe_lower = exe.lower()
+
+    for module in sorted(set(modules)):
+        path = os.path.abspath(module)
+        low = path.lower()
+        if low == exe_lower:
+            continue
+        suspicious_location = (
+            low.startswith(temp_root + os.sep)
+            or low.startswith(user_root + os.sep)
+            or "\\appdata\\local\\temp\\" in low
+            or "\\downloads\\" in low
+            or "\\desktop\\" in low
+        )
+        outside_system = not low.startswith(windows_root + os.sep)
+        if suspicious_location:
+            findings.append(
+                f"{process_name} (PID {pid}) memuat module dari lokasi user/temp: {path}"
+            )
+        elif outside_system and os.path.splitext(low)[1] in {".dll", ".ocx"}:
+            findings.append(
+                f"{process_name} (PID {pid}) memuat DLL non-system; perlu korelasi signature dan parent process: {path}"
+            )
+
+    private_regions = _private_executable_regions(pid)
+    for region in private_regions:
+        if isinstance(region, dict):
+            findings.append(
+                f"{process_name} (PID {pid}) memiliki executable MEM_PRIVATE "
+                f"({region['base']}, {region['size']} bytes); indikator "
+                "UNBACKED_EXECUTABLE_MEMORY, bukan bukti pasti injection."
+            )
+        else:
+            findings.append(str(region))
+
+    if not findings:
+        findings.append(
+            f"Tidak ditemukan indikator mapped DLL atau executable private memory pada "
+            f"{process_name} (PID {pid}); hasil bukan bukti bebas injection."
+        )
+    return findings
 
 
 def is_admin():
@@ -737,6 +923,17 @@ def run(a):
     cfg = load_config(a.config)
     files, driver_set = gather_files(a)
 
+    process_findings = []
+    if a.pid:
+        try:
+            process_findings = process_injection_findings(a.pid, pid_modules(a.pid))
+        except Exception as exc:
+            process_findings = [f"Gagal memeriksa module proses: {exc}"]
+        if not a.json:
+            print("\nIndikator process injection:")
+            for finding in process_findings:
+                print(f"  - {finding}")
+
     if not files:
         print(paint("Tidak ada file untuk dicek.", "33", USE_COLOR))
         return 0
@@ -754,18 +951,25 @@ def run(a):
 
     for record in raw:
         path = record.get("Path", "")
+        hashes = {}
+        hash_error = None
+        try:
+            hashes = calculate_hashes(path)
+            # Loaded driver scan memakai signature, hash lokal, dan IOC config.
+            # Hindari lookup eksternal CIRCL untuk driver kernel.
+            if path.lower() not in driver_set:
+                lookup_items.append((path, hashes["sha256"]))
+        except (OSError, PermissionError) as exc:
+            hash_error = f"Gagal menghitung hash: {exc}"
+
         verdict, reasons = analyze(
             record,
             cfg,
-            kernel=path.lower() in driver_set
+            kernel=path.lower() in driver_set,
+            hashes=hashes
         )
-
-        hashes = {}
-        try:
-            hashes = calculate_hashes(path)
-            lookup_items.append((path, hashes["sha256"]))
-        except (OSError, PermissionError) as exc:
-            reasons.append(f"Gagal menghitung hash: {exc}")
+        if hash_error:
+            reasons.append(hash_error)
 
         metadata = {
             "file_size": record.get("FileSize"),
@@ -806,24 +1010,32 @@ def run(a):
                 "status": "NOT_CHECKED",
                 "message": "Menunggu lookup API"
             },
+            "process_injection_findings": process_findings if a.pid else [],
         })
 
-    print(
-        f"Lookup SHA-256 ke CIRCL Hashlookup "
-        f"untuk {len(lookup_items)} file ..."
-    )
-
+    if lookup_items:
+        print(
+            f"Lookup SHA-256 ke CIRCL Hashlookup "
+            f"untuk {len(lookup_items)} file ..."
+        )
     online = lookup_hashes_online(lookup_items) if lookup_items else {}
 
     for item in results:
-        item["hash_database"] = online.get(
-            item["path"],
-            {
-                "status": "API_ERROR",
+        if item["path"].lower() in driver_set:
+            item["hash_database"] = {
+                "status": "SKIPPED_DRIVER",
                 "source": "CIRCL Hashlookup",
-                "message": "Hash tidak tersedia untuk lookup"
+                "message": "Lookup CIRCL dilewati untuk loaded kernel driver"
             }
-        )
+        else:
+            item["hash_database"] = online.get(
+                item["path"],
+                {
+                    "status": "API_ERROR",
+                    "source": "CIRCL Hashlookup",
+                    "message": "Hash tidak tersedia untuk lookup"
+                }
+            )
 
     print_results(results, a)
 
